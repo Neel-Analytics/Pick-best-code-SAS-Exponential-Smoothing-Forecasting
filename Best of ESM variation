@@ -1,0 +1,141 @@
+libname aa "C:\My_Folder\neel" ;
+
+%global dsn sas_hierarchy sql_hierarchy sas_bysort sql_bysort;
+
+%let dsn= aa.asiandata_1 ;*****original total data;
+
+%let sas_hierarchy = depot sku_class sku ;**** sas hierarchy for sas process;
+
+%let sql_hierarchy = depot,sku_class,sku;**** sql hierarchy for sql process;
+
+%let sas_bysort = depot sku_class sku month ;***sort order for sas process;
+
+%let sql_bysort =  depot,sku_class,sku,month ;***sort order for sql process;
+
+%let depvar = value ;****dependant variable;
+
+%let date = month;*** time variable;
+
+%let int = month ;*** time interval between two consequtive time span;
+
+%let backdays  = 60 ;*** number of days for backdating;
+
+proc sql ;
+create table fbt as select &sql_bysort , sum(&depvar) as &depvar  
+from &dsn 
+where year(month) le 2009
+group by &sql_bysort
+order by &sql_bysort ;quit;
+
+data _null_ ;
+set fbt ;
+call symput("enddate" , put(&date, date9.));
+call symput("numdate" , &date);
+run;
+
+%let cutoffdate =  %sysfunc(putn(%eval(&numdate - &backdays) , date9.)) ;
+
+%macro hpf(data=fbt ,forecast=&depvar , hierarchy =&sas_hierarchy , sort = &sas_bysort , id= &date ,interval=&int ,cutoff= &cutoffdate,lead=2,criterion=mape);
+%let dsn= aa.asiandata_1 ;
+%let sas_hierarchy = depot sku_class sku ;
+%let sql_hierarchy = depot,sku_class,sku;
+%let sas_bysort = depot sku_class sku month ;
+%let sql_bysort =  depot,sku_class,sku,month ;
+%let depvar = value ;
+%let date = month;
+%let int = month ;
+%let backdays  = 60 ;
+
+/*proc datasets lib=work kill nolist; quit;*/
+data view/view=view;
+set &data.;
+by &hierarchy  ;
+simple=&forecast;
+double=&forecast;
+linear=&forecast;
+damptrend=&forecast;
+seasonal=&forecast;
+winters=&forecast;
+addwinters=&forecast;
+run;
+*force hpf to run all ESM models;
+proc hpf data=view out=out outfor=outfor lead=0;
+by &hierarchy ;
+id &id interval=&interval accumulate=total;
+   forecast simple / model=simple;
+   forecast double / model=double;
+   forecast linear / model=linear;
+   forecast damptrend / model=damptrend;
+   forecast seasonal / model=seasonal;
+   forecast addwinters / model=addwinters;
+run;
+
+
+*combine results;
+data select(drop=_name_);
+merge outfor(where=(upcase(_name_)="SIMPLE" and &id ge "&cutoff."d) rename=(predict=simple) keep=actual predict &id _name_ &sort)
+      outfor(where=(upcase(_name_)="DOUBLE" and &id ge "&cutoff."d) rename=(predict=double) keep=predict &id _name_ &sort)
+	  outfor(where=(upcase(_name_)="LINEAR" and &id ge "&cutoff."d) rename=(predict=linear) keep=predict &id _name_ &sort)
+	  outfor(where=(upcase(_name_)="DAMPTREND" and &id ge "&cutoff."d) rename=(predict=damptrend) keep=predict &id _name_ &sort)
+	  outfor(where=(upcase(_name_)="SEASONAL" and &id ge "&cutoff."d) rename=(predict=seasonal) keep=predict &id _name_ &sort)
+	  outfor(where=(upcase(_name_)="ADDWINTERS" and &id ge "&cutoff."d) rename=(predict=addwinters) keep=predict &id _name_ &sort)
+      ;
+by &sort;
+run;
+
+*create external model repostory to contain all ESM forecasts;
+proc hpfexmspec modelrepository=work.external_repository specname=simple;
+exm;
+run;
+proc hpfexmspec modelrepository=work.external_repository specname=double;
+exm;
+run;
+proc hpfexmspec modelrepository=work.external_repository specname=linear;
+exm;
+run;
+proc hpfexmspec modelrepository=work.external_repository specname=damptrend;
+exm;
+run;
+proc hpfexmspec modelrepository=work.external_repository specname=seasonal;
+exm;
+run;
+proc hpfexmspec modelrepository=work.external_repository specname=addwinters;
+exm;
+run;
+proc hpfselect modelrepository=work.external_repository selectname=external_select;
+specification simple/exmmap(predict=simple);
+specification double/exmmap(predict=double);
+specification linear/exmmap(predict=linear);
+specification damptrend/exmmap(predict=damptrend);
+specification seasonal/exmmap(predict=seasonal);
+specification addwinters/exmmap(predict=addwinters);
+select criterion=&criterion;
+run;
+
+*pick winning model based on limited history;
+proc hpfengine data=select 
+modelrepository=work.external_repository 
+globalselection=external_select 
+out=_null_
+outstatselect=outstatselect
+(keep=_model_ _selected_  mape) 
+lead=0;
+by &hierarchy  ;
+id &id interval=month;
+forecast actual;
+external simple double linear damptrend seasonal 
+addwinters;
+run;
+
+data _null_;
+set outstatselect(where=(_selected_="YES") obs=1);
+call symput("model",_MODEL_);
+run;
+*rerun HPF using winning model only and create forecasts;
+proc hpf data=&data out=forecast plot=forecasts lead=&lead;
+by &hierarchy ;
+id &id interval=&interval accumulate=total;
+   forecast &forecast / model=&model;
+run;
+%mend;
+%hpf(data=fbt ,forecast=&depvar , hierarchy =&sas_hierarchy , sort = &sas_bysort , id= &date ,interval=&int ,cutoff= &cutoffdate,lead=2,criterion=mape);
